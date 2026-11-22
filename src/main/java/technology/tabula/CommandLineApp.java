@@ -4,9 +4,17 @@ import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FilenameFilter;
 import java.io.FileWriter;
+import java.io.Flushable;
 import java.io.IOException;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
@@ -24,6 +32,10 @@ import technology.tabula.extractors.BasicExtractionAlgorithm;
 import technology.tabula.extractors.SpreadsheetExtractionAlgorithm;
 import technology.tabula.writers.CSVWriter;
 import technology.tabula.writers.JSONWriter;
+import technology.tabula.writers.StreamingCSVWriter;
+import technology.tabula.writers.StreamingJSONWriter;
+import technology.tabula.writers.StreamingTSVWriter;
+import technology.tabula.writers.StreamingWriter;
 import technology.tabula.writers.TSVWriter;
 import technology.tabula.writers.Writer;
 
@@ -37,6 +49,8 @@ public class CommandLineApp {
     private static final int RELATIVE_AREA_CALCULATION_MODE = 0;
     private static final int ABSOLUTE_AREA_CALCULATION_MODE = 1;
 
+    private static final String STREAMING_OPTION = "streaming";
+
 
     private Appendable defaultOutput;
 
@@ -45,6 +59,7 @@ public class CommandLineApp {
     private OutputFormat outputFormat;
     private String password;
     private TableExtractor tableExtractor;
+    private boolean streaming;
 
     public CommandLineApp(Appendable defaultOutput, CommandLine line) throws ParseException {
         this.defaultOutput = defaultOutput;
@@ -52,6 +67,7 @@ public class CommandLineApp {
         this.pages = CommandLineApp.whichPages(line);
         this.outputFormat = CommandLineApp.whichOutputFormat(line);
         this.tableExtractor = CommandLineApp.createExtractor(line);
+        this.streaming = line.hasOption(STREAMING_OPTION);
 
         if (line.hasOption('s')) {
             this.password = line.getOptionValue('s');
@@ -127,7 +143,11 @@ public class CommandLineApp {
 
     public void extractFileTables(CommandLine line, File pdfFile) throws ParseException {
         if (!line.hasOption('o')) {
-            extractFile(pdfFile, this.defaultOutput);
+            if (this.streaming) {
+                extractFileStreaming(pdfFile, this.defaultOutput);
+            } else {
+                extractFile(pdfFile, this.defaultOutput);
+            }
             return;
         }
 
@@ -136,6 +156,11 @@ public class CommandLineApp {
     }
 
     public void extractFileInto(File pdfFile, File outputFile) throws ParseException {
+        if (this.streaming) {
+            extractFileStreamingInto(pdfFile, outputFile);
+            return;
+        }
+
         BufferedWriter bufferedWriter = null;
         try {
             FileWriter fileWriter = new FileWriter(outputFile.getAbsoluteFile());
@@ -165,26 +190,7 @@ public class CommandLineApp {
 
             while (pageIterator.hasNext()) {
                 Page page = pageIterator.next();
-
-                if (tableExtractor.verticalRulingPositions != null) {
-                    for (Float verticalRulingPosition : tableExtractor.verticalRulingPositions) {
-                        page.addRuling(new Ruling(0, verticalRulingPosition, 0.0f, (float) page.getHeight()));
-                    }
-                }
-
-                if (pageAreas != null) {
-                    for (Pair<Integer, Rectangle> areaPair : pageAreas) {
-                        Rectangle area = areaPair.getRight();
-                        if (areaPair.getLeft() == RELATIVE_AREA_CALCULATION_MODE) {
-                            area = new Rectangle((float) (area.getTop() / 100 * page.getHeight()),
-                                    (float) (area.getLeft() / 100 * page.getWidth()), (float) (area.getWidth() / 100 * page.getWidth()),
-                                    (float) (area.getHeight() / 100 * page.getHeight()));
-                        }
-                        tables.addAll(tableExtractor.extractTables(page.getArea(area)));
-                    }
-                } else {
-                    tables.addAll(tableExtractor.extractTables(page));
-                }
+                tables.addAll(extractTables(page));
             }
             writeTables(tables, outFile);
         } catch (IOException e) {
@@ -199,6 +205,166 @@ public class CommandLineApp {
             }
         }
     }
+
+    /**
+     * Streams the output of a whole document, one page at a time, so that the
+     * tables of a page can be discarded as soon as they have been serialized.
+     */
+    private void extractFileStreaming(File pdfFile, Appendable outFile) throws ParseException {
+        StreamingWriter writer = createStreamingWriter();
+        PDDocument pdfDocument = null;
+        try {
+            pdfDocument = this.password == null ? Loader.loadPDF(pdfFile) : Loader.loadPDF(pdfFile, password);
+            PageIterator pageIterator = getPageIterator(pdfDocument);
+
+            writer.writeStart(outFile);
+            while (pageIterator.hasNext()) {
+                Page page = pageIterator.next();
+                if (page == null) {
+                    throw new ParseException("Error extracting page");
+                }
+                List<Table> tables = extractTables(page);
+                try {
+                    writer.writePage(outFile, tables);
+                } finally {
+                    // release the table data of the page that was just written
+                    tables.clear();
+                }
+                if (outFile instanceof Flushable) {
+                    ((Flushable) outFile).flush();
+                }
+            }
+            writer.writeEnd(outFile);
+        } catch (IOException e) {
+            throw new ParseException(e.getMessage());
+        } finally {
+            try {
+                if (pdfDocument != null) {
+                    pdfDocument.close();
+                }
+            } catch (IOException e) {
+                System.out.println("Error in closing pdf document" + e);
+            }
+        }
+    }
+
+    /**
+     * Extracts the tables of a single page, in the same order as the
+     * non-streaming implementation.
+     */
+    private List<Table> extractTables(Page page) {
+        List<Table> tables = new ArrayList<>();
+
+        if (tableExtractor.verticalRulingPositions != null) {
+            for (Float verticalRulingPosition : tableExtractor.verticalRulingPositions) {
+                page.addRuling(new Ruling(0, verticalRulingPosition, 0.0f, (float) page.getHeight()));
+            }
+        }
+
+        if (pageAreas != null) {
+            for (Pair<Integer, Rectangle> areaPair : pageAreas) {
+                Rectangle area = areaPair.getRight();
+                if (areaPair.getLeft() == RELATIVE_AREA_CALCULATION_MODE) {
+                    area = new Rectangle((float) (area.getTop() / 100 * page.getHeight()),
+                            (float) (area.getLeft() / 100 * page.getWidth()), (float) (area.getWidth() / 100 * page.getWidth()),
+                            (float) (area.getHeight() / 100 * page.getHeight()));
+                }
+                tables.addAll(tableExtractor.extractTables(page.getArea(area)));
+            }
+        } else {
+            tables.addAll(tableExtractor.extractTables(page));
+        }
+        return tables;
+    }
+
+    /**
+     * Writes the whole document to a temporary file in the target's directory
+     * and atomically replaces the target once the output is complete and
+     * closed. On any failure the previous output is left untouched and the
+     * temporary file is removed.
+     */
+    private void extractFileStreamingInto(File pdfFile, File outputFile) throws ParseException {
+        Path target;
+        try {
+            target = outputFile.getAbsoluteFile().toPath();
+        } catch (RuntimeException e) {
+            throw new ParseException("Cannot resolve output file " + outputFile);
+        }
+        Path parent = target.getParent();
+        if (parent == null) {
+            throw new ParseException("Cannot resolve output file " + outputFile);
+        }
+
+        Path tempFile = null;
+        BufferedWriter bufferedWriter = null;
+        boolean replaced = false;
+        try {
+            tempFile = createTempFile(parent, target.getFileName().toString());
+            bufferedWriter = new BufferedWriter(new FileWriter(tempFile.toFile()));
+
+            extractFileStreaming(pdfFile, bufferedWriter);
+
+            bufferedWriter.flush();
+            bufferedWriter.close();
+            bufferedWriter = null;
+
+            replaceAtomically(tempFile, target);
+            replaced = true;
+        } catch (AtomicMoveNotSupportedException e) {
+            throw new ParseException("Atomic replacement is not supported for " + outputFile + ": " + e.getMessage());
+        } catch (UnsupportedOperationException e) {
+            throw new ParseException("Atomic replacement is not supported for " + outputFile + ": " + e.getMessage());
+        } catch (ParseException e) {
+            throw e;
+        } catch (IOException e) {
+            throw new ParseException("Cannot write file " + outputFile + ": " + e.getMessage());
+        } catch (RuntimeException e) {
+            throw new ParseException("Cannot write file " + outputFile + ": " + e.getMessage());
+        } finally {
+            if (bufferedWriter != null) {
+                try {
+                    bufferedWriter.close();
+                } catch (IOException e) {
+                    // the temporary file is removed below, so the failure to
+                    // close it does not affect the existing output
+                }
+            }
+            if (!replaced && tempFile != null) {
+                try {
+                    Files.deleteIfExists(tempFile);
+                } catch (IOException e) {
+                    // best effort cleanup; the target was never touched
+                }
+            }
+        }
+    }
+
+    private static Path createTempFile(Path directory, String targetName) throws IOException {
+        String prefix = "." + targetName;
+        if (prefix.length() > 64) {
+            prefix = prefix.substring(0, 64);
+        }
+        if (prefix.length() < 3) {
+            prefix = ".tmp";
+        }
+        // Use a plain CREATE_NEW file so that the usual umask-derived
+        // permissions apply, as they do for the non-streaming output file.
+        for (int attempt = 0; attempt < 100; attempt++) {
+            Path candidate = directory.resolve(prefix + "." + UUID.randomUUID().toString().replace("-", "") + ".tmp");
+            try {
+                Files.newOutputStream(candidate, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE).close();
+                return candidate;
+            } catch (FileAlreadyExistsException e) {
+                // try another name
+            }
+        }
+        throw new IOException("Cannot create a temporary file in " + directory);
+    }
+
+    private static void replaceAtomically(Path tempFile, Path target) throws IOException {
+        Files.move(tempFile, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+    }
+
 
     private PageIterator getPageIterator(PDDocument pdfDocument) throws IOException {
         ObjectExtractor extractor = new ObjectExtractor(pdfDocument);
@@ -358,6 +524,13 @@ public class CommandLineApp {
                 .hasArg()
                 .argName("AREA")
                 .build());
+        o.addOption(Option.builder()
+                .longOpt(STREAMING_OPTION)
+                .desc("Stream each page's tables as soon as they are extracted instead of accumulating the whole document. "
+                        + "Content and ordering are identical to the default mode. When writing to a file with -o/--outfile, "
+                        + "output goes to a temporary file in the target's directory that atomically replaces the target "
+                        + "only after it has been written and closed; on failure the existing output is kept.")
+                .build());
         o.addOption(Option.builder("p")
                 .longOpt("pages")
                 .desc("Comma separated list of ranges, or all. Examples: --pages 1-3,5-7, --pages 3 or --pages all. Default is --pages 1")
@@ -456,6 +629,19 @@ public class CommandLineApp {
         public List<Table> extractTablesSpreadsheet(Page page) {
             // TODO add useLineReturns
             return spreadsheetExtractor.extract(page);
+        }
+    }
+
+    private StreamingWriter createStreamingWriter() {
+        switch (outputFormat) {
+            case CSV:
+                return new StreamingCSVWriter();
+            case JSON:
+                return new StreamingJSONWriter();
+            case TSV:
+                return new StreamingTSVWriter();
+            default:
+                throw new IllegalArgumentException("Unsupported output format: " + outputFormat);
         }
     }
 

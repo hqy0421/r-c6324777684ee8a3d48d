@@ -16,8 +16,8 @@ Download a version of the tabula-java's jar, with all dependencies included, tha
 ```
 $ java -jar target/tabula-1.0.5-jar-with-dependencies.jar --help
 usage: tabula [-a <AREA>] [-b <DIRECTORY>] [-c <COLUMNS>] [-f <FORMAT>]
-       [-g] [-h] [-i] [-l] [-n] [-o <OUTFILE>] [-p <PAGES>] [-r] [-s
-       <PASSWORD>] [-t] [-u] [-v]
+       [-g] [-h] [-i] [-l] [-n] [-o <OUTFILE>] [-p <PAGES>]
+       [-r] [-s <PASSWORD>] [--streaming] [-t] [-u] [-v]
 
 Tabula helps you extract tables from PDFs
 
@@ -61,6 +61,14 @@ Tabula helps you extract tables from PDFs
                             separating each cell, as in a PDF of an Excel
                             spreadsheet)
  -s,--password <PASSWORD>   Password to decrypt document. Default is empty
+    --streaming             Stream each page's tables as soon as they are
+                            extracted instead of accumulating the whole
+                            document. Content and ordering are identical to
+                            the default mode. When writing to a file with
+                            -o/--outfile, output goes to a temporary file in
+                            the target's directory that atomically replaces
+                            the target only after it has been written and
+                            closed; on failure the existing output is kept.
  -t,--stream                Force PDF to be extracted using stream-mode
                             extraction (if there are no ruling lines
                             separating each cell)
